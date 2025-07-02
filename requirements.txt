@@ -1,0 +1,14 @@
+llama-index
+llama-index-embeddings-ollama
+llama-index-llms-ollama
+streamlit
+llama-index-retrievers-bm25
+fuzzywuzzy
+llama-index-vector-stores-qdrant
+qdrant-client
+streamlit
+pandas
+nest_asyncio
+auth
+mysql-connector-python
+llama_index.llms.gemini

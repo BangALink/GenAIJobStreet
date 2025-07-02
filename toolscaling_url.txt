@@ -1,0 +1,204 @@
+import streamlit as st
+from llama_index.llms.ollama import Ollama
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
+from llama_index.readers.file import CSVReader
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core import Settings
+from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.retrievers.bm25 import BM25Retriever
+from llama_index.core.chat_engine import CondensePlusContextChatEngine
+from llama_index.core.retrievers import QueryFusionRetriever
+from llama_index.core.tools import BaseTool, FunctionTool
+from llama_index.core.agent import ReActAgent
+from typing import Optional
+from llama_index.core import PromptTemplate
+from llama_index.llms.gemini import Gemini
+import asyncio 
+import nest_asyncio
+import sys
+import logging
+import requests
+import os
+nest_asyncio.apply()
+splitter = SentenceSplitter(chunk_size=512)
+# Initialize logging
+logging.basicConfig(stream=sys.stdout, level=logging.WARNING)
+logging.getLogger().addHandler(logging.StreamHandler(stream=sys.stdout))
+
+# Initialize settings
+system_prompt = """
+You are a multi-lingual career advisor expert who has knowledge based on 
+real-time data. You will always try to be helpful and try to help them 
+answering their question. If you don't know the answer, say that you DON'T
+KNOW.
+
+You primary job is to help students find jobs related to their interests from the Jobstreet Platform.
+"""
+react_system_header_str = """\
+
+## Tools
+You have access to a wide variety of tools. You are responsible for using
+the tools in any sequence you deem appropriate to complete the task at hand.
+This may require breaking the task into subtasks and using different tools
+to complete each subtask.
+
+You have access to the following tools:
+{tool_desc}
+
+## Output Format
+To answer the question, please use the following format.
+
+```
+Thought: I need to use a tool to help me answer the question.
+Action: tool name (one of {tool_names}) if using a tool.
+Action Input: the input to the tool, in a JSON format representing the kwargs (e.g. {{"input": "hello world", "num_beams": 5}})
+```
+
+Please ALWAYS start with a Thought.
+
+Please use a valid JSON format for the Action Input. Do NOT do this {{'input': 'hello world', 'num_beams': 5}}.
+
+If this format is used, the user will respond in the following format:
+
+```
+Observation: tool response
+```
+
+You should keep repeating the above format until you have enough information
+to answer the question without using any more tools. At that point, you MUST respond
+in the one of the following two formats:
+
+```
+Thought: I can answer without using any more tools.
+Answer: [your answer here]
+```
+
+```
+Thought: I cannot answer the question with the provided tools.
+Answer: Sorry, I cannot answer your query.
+```
+
+## Additional Rules
+- You MUST obey the function signature of each tool. Do NOT pass in no arguments if the function expects arguments.
+
+## Current Conversation
+Below is the current conversation consisting of interleaving human and assistant messages.
+
+"""
+react_system_prompt = PromptTemplate(react_system_header_str)
+Settings.llm = Gemini(
+    model="models/gemini-2.0-flash",
+    api_key="YOUR_GEMINI_API",  # Replace with your own API key
+    system_prompt=system_prompt, temperature=0
+)
+Settings.embed_model = OllamaEmbedding(base_url="http://127.0.0.1:11434", model_name="mxbai-embed-large:latest")
+
+# Main Program
+st.title("RAG Test")
+
+# Initialize chat history if empty
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Halo! Mau tahu apa tentang pekerjaan?"}
+    ]
+
+def job_json_to_natural_language(json_data, keyword):
+    """Converts job JSON data to formatted text with links"""
+    if "data" not in json_data:
+        return f"No job listings found for '{keyword}'."
+    
+    output = [f"Here are some of the '{keyword}' job postings found on JobStreet:"]
+    
+    for idx, job in enumerate(json_data["data"], 1):
+        title = job.get("title", "Unknown Position")
+        company = job.get("companyName", job.get("advertiser", {}).get("description", "Unknown Company"))
+        location = ", ".join([loc.get("label", "Unknown") for loc in job.get("locations", [])])
+        posted = job.get("listingDateDisplay", "Unknown date")
+        work_type = ", ".join(job.get("workTypes", []))
+        work_arrangement = ", ".join(
+            [wa.get("label", {}).get("text", "") for wa in job.get("workArrangements", {}).get("data", [])]
+        )
+        description = job.get("teaser", "No description available")
+        job_id = job.get("id", "")
+        job_url = f"https://www.jobstreet.co.id/id/job/{job_id}" if job_id else "URL not available"
+        
+        output.append(
+            f"{idx}. **{title}**\n"
+            f"   - **Company**: {company}\n"
+            f"   - **Location**: {location}\n"
+            f"   - **Posted**: {posted}\n"
+            f"   - **Job Type**: {work_type} ({work_arrangement})\n"
+            f"   - **Description**: {description}\n"
+            f"   - **Job Link**: {job_url}\n"
+        )
+    
+    return "\n".join(output)
+
+async def search_jobstreet(keyword: str) -> str:
+    """Searches JobStreet for matching jobs"""
+    try:
+        r = requests.get(
+            "https://id.jobstreet.com/api/jobsearch/v5/search",
+            params={
+                "siteKey": "ID-Main",
+                "sourcesystem": "houston",
+                "page": "1",
+                "worktype": "242",
+                "sortmode": "ListedDate",
+                "pageSize": "32",
+                "include": "seodata,joracrosslink,gptTargeting,pills",
+                "locale": "id-ID",
+                "keywords": keyword,
+                "baseKeywords": keyword,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return job_json_to_natural_language(data, keyword)
+    except Exception as e:
+        return f"Error searching for jobs: {str(e)}"
+
+search_jobstreet_tool = FunctionTool.from_defaults(
+    fn=search_jobstreet,
+    name="job_search",
+    description="Searches for jobs on JobStreet based on keywords"
+)
+
+# Initialize chat
+if "chat_engine" not in st.session_state:
+    memory = ChatMemoryBuffer.from_defaults(token_limit=32768)
+    st.session_state.chat_engine = ReActAgent.from_tools(
+        [search_jobstreet_tool],
+        chat_mode="react",
+        verbose=True,
+        memory=memory,
+        llm=Settings.llm,
+        system_prompt=system_prompt,
+    )
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Halo! Mau tahu apa tentang pekerjaan?"}
+    ]
+
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# Handle user input
+if prompt := st.chat_input("Apa yang ingin Anda cari?"):
+    # Add user message to chat
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # Get assistant response
+    with st.chat_message("assistant"):
+        with st.spinner("Mencari..."):
+            response = st.session_state.chat_engine.chat(prompt)
+            st.markdown(response.response)
+    
+    # Add assistant response to chat history
+    st.session_state.messages.append({"role": "assistant", "content": response.response})
